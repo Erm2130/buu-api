@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+playwright
+aiofiles
+pydantic
+sqlalchemy
+psycopg2-binary
