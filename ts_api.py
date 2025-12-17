@@ -43,12 +43,10 @@ if not os.path.exists(MAPS_DIR):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ==========================================
-# 💾 Database Configuration (Smart Switch)
+# 💾 Database Configuration
 # ==========================================
-# Use DATABASE_URL if on Cloud, else use local sqlite
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}")
 
-# Fix postgres protocol for SQLAlchemy
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -63,11 +61,10 @@ class UserDB(Base):
     __tablename__ = "users"
 
     username = Column(String, primary_key=True, index=True)
-    line_token = Column(String, nullable=True) # Stores Telegram Chat ID
+    line_token = Column(String, nullable=True)
     schedule_json = Column(Text, default="[]") 
     last_updated = Column(DateTime, default=datetime.now)
 
-# Create tables
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -80,8 +77,7 @@ def get_db():
 # ==========================================
 # 📍 Room & Image Logic
 # ==========================================
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") 
-SERVER_URL = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else "http://localhost:8080"
+SERVER_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8080")
 
 def get_room_details(room_code):
     room_code = room_code.strip()
@@ -109,7 +105,6 @@ def get_room_details(room_code):
     
     return building_name, full_image_url
 
-# ------------------- Helpers ------------------- #
 def safe_text(locator):
     try: return locator.inner_text().strip()
     except: return ""
@@ -118,68 +113,72 @@ def parse_time(time_str):
     try: return datetime.strptime(time_str, "%H:%M")
     except: return datetime.max
 
-# ------------------- Scraping Logic (Stealth Mode) ------------------- #
+# ------------------- Scraping Logic (Strict Mode) ------------------- #
 def extract_student_info(username, password):
     log(f"🚀 Scraping started for: {username}")
     with sync_playwright() as p:
-        # Important: Use specific args to bypass detection and run on Render
         browser = p.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled' 
+                '--disable-blink-features=AutomationControlled'
             ]
         )
         
-        # Set User Agent to look like a real browser
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={'width': 1280, 'height': 720}
         )
         page = context.new_page()
         
         try:
             page.goto("https://reg.buu.ac.th/", timeout=60000)
-            
-            # Wait for load - relaxed constraint
             try: page.wait_for_load_state("domcontentloaded", timeout=10000)
             except: pass
             
-            # Check for login inputs directly or click login button
+            # คลิกปุ่ม Login
             if page.locator("input[name='f_uid']").count() > 0:
-                pass # Already on login inputs
+                pass 
             elif page.locator("text=เข้าสู่ระบบ").count() > 0:
                 page.click("text=เข้าสู่ระบบ")
             else:
-                # Retry reload if stuck
                 page.reload()
                 if page.locator("text=เข้าสู่ระบบ").count() > 0:
                     page.click("text=เข้าสู่ระบบ")
 
-            # Fill credentials
-            page.wait_for_selector("input[name='f_uid']", timeout=15000)
+            # กรอกรหัส
+            log("🔑 Logging in...")
+            try:
+                page.wait_for_selector("input[name='f_uid']", timeout=15000)
+            except:
+                raise Exception("โหลดหน้า Login ไม่ทัน (Timeout)")
+
             page.fill("input[name='f_uid']", username)
             page.fill("input[name='f_pwd']", password)
             page.click("input[type='submit']")
             time.sleep(3)
             
-            # Check login success
+            # [CRITICAL UPDATE] ตรวจสอบผลการล็อกอินแบบเข้มงวด
             if page.locator("text=ตารางเรียน/สอบ").count() == 0:
+                # เช็คว่ามีข้อความแจ้งเตือนรหัสผิดไหม
                 if page.locator("text=รหัสผ่านไม่ถูกต้อง").count() > 0:
-                    log("❌ Wrong password")
+                    log("❌ Wrong password identified")
+                    raise Exception("WRONG_PASSWORD") # ส่ง Signal เฉพาะเจาะจง
                 else:
                     log("❌ Login failed or menu not found")
-                return [] 
+                    raise Exception("LOGIN_FAILED_NO_MENU")
             
             log("✅ Login success!")
             page.click("text=ตารางเรียน/สอบ")
             
-            # Wait for table
             try: page.wait_for_selector("#myTable", timeout=15000)
-            except: log("⚠️ Table load timeout, proceeding anyway...")
+            except: 
+                log("⚠️ Table load timeout")
+                raise Exception("TABLE_TIMEOUT") # ถ้าหาตารางไม่เจอ ก็ให้พังไปเลย ไม่ส่งค่าว่าง
             
-            # --- Extract Data (Original Logic) ---
-            log("📚 Reading subjects...")
+            # --- Extract Data ---
+            log("📚 Reading data...")
             myTable_raw = {}
             rows = page.locator("//*[@id='myTable']/tbody/tr")
             for i in range(rows.count()):
@@ -192,9 +191,7 @@ def extract_student_info(username, password):
                         lines = [x.strip() for x in name_text.split('\n') if x.strip()]
                         myTable_raw[code] = {"code": code, "name_en": lines[0] if len(lines)>0 else "", "name_th": lines[1] if len(lines)>1 else ""}
             
-            log("📅 Reading schedule...")
             mainTable_raw = []
-            # Loop through rows 3 to 11 (standard timetable rows)
             for i in range(3, 12):
                 row = page.locator(f"//*[@id='page']/table[3]/tbody/tr/td[2]/table[3]/tbody/tr/td/table/tbody/tr[{i}]")
                 if row.count() > 0:
@@ -210,17 +207,13 @@ def extract_student_info(username, password):
                                 col_data.append(parts)
                         mainTable_raw.append({"day": day, "columns": col_data})
             
-            # Process & Match
             finalTable = []
             seen = set()
             for item in mainTable_raw:
                 day = item["day"]
                 for col in item["columns"]:
-                    # Basic validation: needs at least code
                     if len(col) < 1: continue
-                    
                     code = col[0]
-                    # Flexible index for room/time based on array length
                     room = col[2] if len(col) > 2 else "-"
                     time_val = col[3].replace("(", "").replace(")", "") if len(col) > 3 else "-"
                     
@@ -236,7 +229,6 @@ def extract_student_info(username, password):
                             "room": room, "time": time_val
                         })
             
-            # Group by Subject Code
             grouped = defaultdict(list)
             for x in finalTable:
                 grouped[x['code']].append({"day": x['day'], "time": x['time'], "room": x['room']})
@@ -250,16 +242,16 @@ def extract_student_info(username, password):
                     "schedules": schedules
                 })
             
-            log(f"✅ Extraction complete: Found {len(result)} subjects")
+            log(f"✅ Extraction complete: {len(result)} subjects")
             return result
             
         except Exception as e:
             log(f"❌ Scraping Error: {e}")
-            raise e
+            raise e # [IMPORTANT] โยน Error ขึ้นไปเพื่อให้ API รู้ว่าพัง
         finally:
             browser.close()
 
-# --- API Models ---
+# --- API Endpoints ---
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -268,16 +260,14 @@ class TokenRequest(BaseModel):
     username: str
     line_token: str
 
-# ==================== API ENDPOINTS ====================
-
 @app.post("/timetable")
 def api_login(req: LoginRequest, db: Session = Depends(get_db)):
     log(f"📩 API Login Request: {req.username}")
     try:
-        # 1. Scrape Data
+        # 1. Scrape Data (ถ้าพัง มันจะเด้งไป catch ทันที)
         data = extract_student_info(req.username, req.password)
         
-        # 2. Enrich Data (Add Map Images & Building Names)
+        # 2. Enrich Data
         enriched_schedule = []
         for subject in data:
             enriched_sessions = []
@@ -288,12 +278,11 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
                     "building": b_name, "map_image": img_url
                 }
                 enriched_sessions.append(new_session)
-            
             new_subject = subject.copy()
             new_subject["schedules"] = enriched_sessions
             enriched_schedule.append(new_subject)
 
-        # 3. Save to Database
+        # 3. Save to Database (ทำเมื่อ Login ผ่านแล้วเท่านั้น)
         user = db.query(UserDB).filter(UserDB.username == req.username).first()
         if not user:
             user = UserDB(username=req.username)
@@ -308,7 +297,14 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
         
     except Exception as e:
         log(f"❌ API Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # ดักจับ Error ที่เรา Raise มา แล้วส่ง Status 401 หรือ 500
+        error_msg = str(e)
+        if "WRONG_PASSWORD" in error_msg or "LOGIN_FAILED" in error_msg:
+            raise HTTPException(status_code=401, detail="รหัสผ่านไม่ถูกต้อง หรือเข้าสู่ระบบไม่ได้")
+        elif "TABLE_TIMEOUT" in error_msg:
+            raise HTTPException(status_code=504, detail="โหลดข้อมูลตารางเรียนไม่ทัน (เว็บมหาลัยช้า)")
+        else:
+            raise HTTPException(status_code=500, detail="เกิดข้อผิดพลาดที่ระบบ")
 
 @app.post("/save-line-token")
 def api_save_token(req: TokenRequest, db: Session = Depends(get_db)):
@@ -318,7 +314,6 @@ def api_save_token(req: TokenRequest, db: Session = Depends(get_db)):
         if not user:
             user = UserDB(username=req.username)
             db.add(user)
-        
         user.line_token = req.line_token
         db.commit()
         log(f"💾 Telegram ID Saved")
@@ -331,13 +326,9 @@ def api_n8n(db: Session = Depends(get_db)):
     log("📩 n8n triggered")
     users = db.query(UserDB).filter(UserDB.line_token != None).all()
     
-    # Use real day mappings
     thai_days = {"Monday": "จันทร์", "Tuesday": "อังคาร", "Wednesday": "พุธ", "Thursday": "พฤหัสบดี", "Friday": "ศุกร์", "Saturday": "เสาร์", "Sunday": "อาทิตย์"}
     target_day = thai_days.get(datetime.now().strftime("%A"), "จันทร์")
     
-    # Mock Monday for testing if needed
-    # target_day = "จันทร์"
-
     output = []
     for user in users:
         if not user.schedule_json: continue
