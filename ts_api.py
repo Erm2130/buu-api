@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+# --- Force Print ---
 def log(msg):
     now = datetime.now().strftime('%H:%M:%S')
     print(f"[{now}] {msg}", file=sys.stdout, flush=True)
@@ -30,7 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Config ---
+# ------------------- Config ------------------- #
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MAPS_DIR = os.path.join(STATIC_DIR, "maps")
@@ -40,41 +41,50 @@ if not os.path.exists(MAPS_DIR):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ------------------- Database Configuration ------------------- #
-# ตรวจสอบว่ามี DATABASE_URL หรือไม่
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ------------------- Database Setup (แก้ตรงนี้!) ------------------- #
 
-DB_TYPE = "UNKNOWN"
+# 👇👇👇 เอาลิงก์จาก Neon.tech มาวางในเครื่องหมายคำพูดตรงนี้ครับ 👇👇👇
+NEON_DB_URL = "postgresql://neondb_owner:****************@ep-misty-scene-adbadt6l-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+# ตัวอย่าง: "postgresql://neondb_owner:AbCd@ep-cool.aws.neon.tech/neondb?sslmode=require"
 
-if DATABASE_URL:
-    # ถ้ามี URL จาก Render (PostgreSQL)
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    DB_TYPE = "PostgreSQL (Cloud)"
+# Logic การเลือก Database (ถ้าใส่ลิงก์ข้างบนจะใช้ Neon, ถ้าไม่ใส่จะใช้ไฟล์ในเครื่อง)
+if "วางลิงก์" not in NEON_DB_URL and NEON_DB_URL.strip() != "":
+    DATABASE_URL = NEON_DB_URL
 else:
-    # ถ้าไม่มี ใช้ SQLite (Local)
+    # ใช้ค่าจาก Render (ถ้ามี) หรือใช้ Local DB
+    DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}")
+
+# แก้ Bug ลิงก์ Postgres
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+log(f"💽 กำลังเชื่อมต่อ Database: {'Neon/PostgreSQL (Cloud)' if 'postgres' in DATABASE_URL else 'SQLite (Local)'}")
+
+try:
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+except Exception as e:
+    log(f"❌ Database Connection Error: {e}")
+    # Fallback to local if connection fails
     DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}"
-    DB_TYPE = "SQLite (Local - ข้อมูลจะหายเมื่อ Restart)"
-
-log(f"💽 กำลังใช้งาน Database: {DB_TYPE}")
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
 
 class UserDB(Base):
     __tablename__ = "users"
     username = Column(String, primary_key=True, index=True)
-    line_token = Column(String, nullable=True)
+    line_token = Column(String, nullable=True) # เก็บ Telegram Chat ID
     schedule_json = Column(Text, default="[]") 
     last_updated = Column(DateTime, default=datetime.now)
 
-# สร้างตาราง
+# สร้างตารางใน Database (ถ้ายังไม่มี)
 try:
     Base.metadata.create_all(bind=engine)
-    log("✅ สร้างตารางใน Database สำเร็จ")
+    log("✅ สร้าง/ตรวจสอบตารางใน Database สำเร็จ")
 except Exception as e:
-    log(f"❌ เชื่อมต่อ Database ไม่ได้: {e}")
+    log(f"❌ สร้างตารางพลาด: {e}")
 
 def get_db():
     db = SessionLocal()
@@ -257,7 +267,6 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
             new_subject["schedules"] = enriched_sessions
             enriched_schedule.append(new_subject)
 
-        # Database Commit
         user = db.query(UserDB).filter(UserDB.username == req.username).first()
         if not user:
             user = UserDB(username=req.username)
@@ -267,9 +276,8 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
         user.last_updated = datetime.now()
         db.commit()
         
-        log(f"💾 บันทึกตารางลง {DB_TYPE} เรียบร้อย") # แจ้งเตือนว่าลง DB ไหน
+        log(f"💾 บันทึกข้อมูลลง Database เรียบร้อย")
         return {"status": "success", "data": enriched_schedule}
-        
     except Exception as e:
         log(f"❌ API Error: {e}")
         error_msg = str(e)
@@ -320,26 +328,6 @@ def api_n8n(db: Session = Depends(get_db)):
     
     return {"count": len(output), "data": output}
 
-# [NEW] Debug Endpoint - เช็คสถานะ Database
-@app.get("/debug/db-status")
-def debug_db(db: Session = Depends(get_db)):
-    user_count = db.query(UserDB).count()
-    users = db.query(UserDB).all()
-    
-    user_list = []
-    for u in users:
-        user_list.append({
-            "username": u.username,
-            "has_token": bool(u.line_token),
-            "last_updated": u.last_updated
-        })
-
-    return {
-        "status": "Online",
-        "database_type": DB_TYPE,
-        "total_users": user_count,
-        "users": user_list
-    }
-
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080)
+    print(f"\n >>> SERVER STARTED (PORT 8080) <<<")
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
