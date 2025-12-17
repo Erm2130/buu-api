@@ -12,11 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
 # --- Database Imports ---
-from sqlalchemy import create_engine, Column, String, Text, Integer, DateTime
+from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# --- ฟังก์ชัน Print ---
 def log(msg):
     now = datetime.now().strftime('%H:%M:%S')
     print(f"[{now}] {msg}", file=sys.stdout, flush=True)
@@ -31,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- ตั้งค่าโฟลเดอร์รูปภาพ ------------------- #
+# --- Config ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MAPS_DIR = os.path.join(STATIC_DIR, "maps")
@@ -41,44 +40,32 @@ if not os.path.exists(MAPS_DIR):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ==========================================
-# 💾 Database Configuration (Smart Switch)
-# ==========================================
-# ถ้าอยู่บน Cloud จะใช้ DATABASE_URL, ถ้าอยู่เครื่องเราจะใช้ไฟล์ local_database.db
+# --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}")
-
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-log(f"💽 เชื่อมต่อฐานข้อมูล: {'SQLite (Local)' if 'sqlite' in DATABASE_URL else 'PostgreSQL (Cloud)'}")
+log(f"💽 DB: {'SQLite' if 'sqlite' in DATABASE_URL else 'PostgreSQL'}")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- Model ตารางข้อมูล Users ---
 class UserDB(Base):
     __tablename__ = "users"
-
     username = Column(String, primary_key=True, index=True)
-    line_token = Column(String, nullable=True) # ใช้เก็บ Telegram Chat ID
+    line_token = Column(String, nullable=True)
     schedule_json = Column(Text, default="[]") 
     last_updated = Column(DateTime, default=datetime.now)
 
-# สร้างตาราง
 Base.metadata.create_all(bind=engine)
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
-# ==========================================
-# 📍 Logic แปลงรหัสห้อง -> ตึก & รูปภาพ
-# ==========================================
-# ดึง URL ของ Server อัตโนมัติ (ใช้สำหรับสร้างลิงก์รูป)
+# --- Room Logic ---
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") 
 SERVER_URL = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else "http://localhost:8080"
 
@@ -108,7 +95,6 @@ def get_room_details(room_code):
     
     return building_name, full_image_url
 
-# ------------------- Helper Functions ------------------- #
 def safe_text(locator):
     try: return locator.inner_text().strip()
     except: return ""
@@ -117,12 +103,15 @@ def parse_time(time_str):
     try: return datetime.strptime(time_str, "%H:%M")
     except: return datetime.max
 
-# ------------------- Logic ดึงข้อมูล (Scraping) ------------------- #
+# --- Scraping Logic (แก้ไขตรงนี้!) ---
 def extract_student_info(username, password):
     log(f"🚀 เริ่มดึงข้อมูล: {username}")
     with sync_playwright() as p:
-        # บน Server ต้องใช้ headless=True เท่านั้น
-        browser = p.chromium.launch(headless=True) 
+        # [แก้จุดตาย] ต้องใส่ args=['--no-sandbox'] ไม่งั้น Render พังแน่นอน
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox'] 
+        )
         page = browser.new_page()
         try:
             page.goto("https://reg.buu.ac.th/", timeout=60000)
@@ -208,11 +197,11 @@ def extract_student_info(username, password):
             
         except Exception as e:
             log(f"❌ Error: {e}")
-            return []
+            raise e # ส่ง Error กลับไปให้เห็นใน Log
         finally:
             browser.close()
 
-# --- Models ---
+# --- API ---
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -221,16 +210,12 @@ class TokenRequest(BaseModel):
     username: str
     line_token: str
 
-# ==================== API ENDPOINTS ====================
-
 @app.post("/timetable")
 def api_login(req: LoginRequest, db: Session = Depends(get_db)):
     log(f"📩 Login: {req.username}")
     try:
-        # 1. ดึงข้อมูล
         data = extract_student_info(req.username, req.password)
         
-        # 2. ปรุงข้อมูล (ใส่รูป + ชื่อตึก)
         enriched_schedule = []
         for subject in data:
             enriched_sessions = []
@@ -246,7 +231,6 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
             new_subject["schedules"] = enriched_sessions
             enriched_schedule.append(new_subject)
 
-        # 3. บันทึกลง Database
         user = db.query(UserDB).filter(UserDB.username == req.username).first()
         if not user:
             user = UserDB(username=req.username)
@@ -261,6 +245,7 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
         
     except Exception as e:
         log(f"❌ Error: {e}")
+        # สำคัญ: ถ้าพัง ให้คืน 500 พร้อมข้อความ
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/save-line-token")
@@ -284,13 +269,9 @@ def api_n8n(db: Session = Depends(get_db)):
     log("📩 n8n เรียกข้อมูล")
     users = db.query(UserDB).filter(UserDB.line_token != None).all()
     
-    # ใช้วันปัจจุบัน
     thai_days = {"Monday": "จันทร์", "Tuesday": "อังคาร", "Wednesday": "พุธ", "Thursday": "พฤหัสบดี", "Friday": "ศุกร์", "Saturday": "เสาร์", "Sunday": "อาทิตย์"}
     target_day = thai_days.get(datetime.now().strftime("%A"), "จันทร์")
     
-    # Mock วันจันทร์ (ถ้าต้องการเทส ให้เอา Comment ออก)
-    # target_day = "จันทร์"
-
     output = []
     for user in users:
         if not user.schedule_json: continue
@@ -309,15 +290,9 @@ def api_n8n(db: Session = Depends(get_db)):
         
         if classes:
             classes.sort(key=lambda x: parse_time(x['time']))
-            output.append({
-                "username": user.username,
-                "line_user_id": user.line_token,
-                "day": target_day,
-                "classes": classes
-            })
+            output.append({"username": user.username, "line_user_id": user.line_token, "day": target_day, "classes": classes})
     
     return {"count": len(output), "data": output}
 
 if __name__ == "__main__":
-    print(f"\n >>> SERVER STARTED (PORT 8080) <<<")
-    uvicorn.run("ts_api:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
