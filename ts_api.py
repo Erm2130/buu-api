@@ -79,11 +79,11 @@ def get_room_details(room_code):
     if prefix == "S": building_name = "ตึก 100 ปี (สมเด็จพระเทพฯ)"
     elif prefix == "P": building_name = "อาคารวิทยาศาสตร์ (P)"
     elif prefix == "L": building_name = "อาคารเรียนรวม (L)"
+    elif prefix == "ARR" or "ONLINE" in room_code.upper(): building_name = "เรียนออนไลน์จ้า"
     elif prefix == "QS2": building_name = "อาคารภูมิราชนครินทร์ (QS2)"
     elif prefix == "KB": building_name = "อาคารเคบี (KB)"
     elif prefix == "SC": building_name = "อาคารวิทยาศาสตร์ (SC)"
     elif prefix == "EN": building_name = "คณะวิศวกรรมศาสตร์"
-    elif prefix == "ARR" or "ONLINE" in room_code.upper(): building_name = "เรียนออนไลน์จ้า"
 
     full_image_url = ""
     valid_extensions = [".jpg", ".png", ".jpeg"]
@@ -105,7 +105,7 @@ def parse_time(time_str):
     try: return datetime.strptime(time_str, "%H:%M")
     except: return datetime.max
 
-# ------------------- Scraping ------------------- #
+# ------------------- Scraping Logic (Improved Wait) ------------------- #
 def extract_student_info(username, password):
     log(f"🚀 Scraping: {username}")
     with sync_playwright() as p:
@@ -140,6 +140,7 @@ def extract_student_info(username, password):
             page.click("input[type='submit']", force=True)
             time.sleep(3)
             
+            # Check Login
             if page.locator("text=ตารางเรียน/สอบ").count() == 0:
                 if page.locator("text=รหัสผ่านไม่ถูกต้อง").count() > 0:
                     raise Exception("WRONG_PASSWORD")
@@ -149,9 +150,18 @@ def extract_student_info(username, password):
             log("✅ Login success")
             page.click("text=ตารางเรียน/สอบ")
             
-            try: page.wait_for_selector("#myTable", timeout=15000)
-            except: log("⚠️ Table timeout")
+            # [FIX] เพิ่มการรอตารางและข้อมูลแถวให้ชัวร์ขึ้น
+            try: 
+                # รอตัวตาราง
+                page.wait_for_selector("#myTable", timeout=15000)
+                # รอให้มีแถวข้อมูลอย่างน้อย 1 แถว (ป้องกันอ่านตอนตารางว่าง)
+                page.wait_for_selector("#myTable tbody tr", timeout=10000)
+            except: 
+                log("⚠️ Table loaded but might be empty or slow")
             
+            time.sleep(2) # รออีกนิดเพื่อความชัวร์
+
+            # Extract
             log("📚 Reading data...")
             myTable_raw = {}
             rows = page.locator("//*[@id='myTable']/tbody/tr")
@@ -281,9 +291,6 @@ def api_n8n(db: Session = Depends(get_db)):
     thai_days = {"Monday": "จันทร์", "Tuesday": "อังคาร", "Wednesday": "พุธ", "Thursday": "พฤหัสบดี", "Friday": "ศุกร์", "Saturday": "เสาร์", "Sunday": "อาทิตย์"}
     target_day = thai_days.get(datetime.now().strftime("%A"), "จันทร์")
     
-    # Mock วันจันทร์ เพื่อเทส (ถ้าใช้งานจริง ลบบรรทัดนี้ออก)
-    # target_day = "จันทร์"
-
     output = []
     for user in users:
         if not user.schedule_json: continue
@@ -295,15 +302,10 @@ def api_n8n(db: Session = Depends(get_db)):
             for s in subj.get("schedules", []):
                 if s.get("day") == target_day:
                     classes.append({
-                        "code": subj["code"],
-                        "name_en": subj["name_en"],  # <-- ส่งชื่ออังกฤษ
-                        "name_th": subj["name_th"],  # <-- ส่งชื่อไทยเพิ่มมาแล้ว!
-                        "time": s["time"],
-                        "room": s["room"],
-                        "building": s.get("building", ""),
-                        "map_image": s.get("map_image", "")
+                        "code": subj["code"], "name": subj["name_en"], "name_th": subj["name_th"],
+                        "time": s["time"], "room": s["room"],
+                        "building": s.get("building", ""), "map_image": s.get("map_image", "")
                     })
-        
         if classes:
             classes.sort(key=lambda x: parse_time(x['time']))
             output.append({"username": user.username, "line_user_id": user.line_token, "day": target_day, "classes": classes})
