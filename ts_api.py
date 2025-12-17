@@ -41,36 +41,33 @@ if not os.path.exists(MAPS_DIR):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ------------------- Database Setup (แก้ตรงนี้!) ------------------- #
+# ------------------- Database Setup (ใส่ลิงก์ให้แล้วครับ) ------------------- #
+# ลิงก์จาก Neon ของลูกพี่
+NEON_DB_URL = "postgresql://neondb_owner:npg_wFCO0KqEj8sH@ep-misty-scene-adbadt6l-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
-# 👇👇👇 เอาลิงก์จาก Neon.tech มาวางในเครื่องหมายคำพูดตรงนี้ครับ 👇👇👇
-NEON_DB_URL = "postgresql://neondb_owner:****************@ep-misty-scene-adbadt6l-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-# ตัวอย่าง: "postgresql://neondb_owner:AbCd@ep-cool.aws.neon.tech/neondb?sslmode=require"
+# ใช้ลิงก์ Neon ถ้ามี (ถ้าบน Cloud มี ENV ก็จะใช้ของ Cloud ก่อน)
+DATABASE_URL = os.getenv("DATABASE_URL", NEON_DB_URL)
 
-# Logic การเลือก Database (ถ้าใส่ลิงก์ข้างบนจะใช้ Neon, ถ้าไม่ใส่จะใช้ไฟล์ในเครื่อง)
-if "วางลิงก์" not in NEON_DB_URL and NEON_DB_URL.strip() != "":
-    DATABASE_URL = NEON_DB_URL
-else:
-    # ใช้ค่าจาก Render (ถ้ามี) หรือใช้ Local DB
-    DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}")
-
-# แก้ Bug ลิงก์ Postgres
+# แก้ไข URL สำหรับ Postgres (เผื่อบาง Environment)
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-log(f"💽 กำลังเชื่อมต่อ Database: {'Neon/PostgreSQL (Cloud)' if 'postgres' in DATABASE_URL else 'SQLite (Local)'}")
+log(f"💽 กำลังเชื่อมต่อ Database: Neon/PostgreSQL")
 
 try:
     engine = create_engine(DATABASE_URL)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base = declarative_base()
+    # สร้างตาราง
+    Base.metadata.create_all(bind=engine)
+    log("✅ เชื่อมต่อและสร้างตารางใน Neon Database สำเร็จ")
 except Exception as e:
     log(f"❌ Database Connection Error: {e}")
-    # Fallback to local if connection fails
-    DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}"
-    engine = create_engine(DATABASE_URL)
+    # Fallback กรณีฉุกเฉิน
+    engine = create_engine(f"sqlite:///{os.path.join(BASE_DIR, 'local_database.db')}")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base = declarative_base()
+    Base.metadata.create_all(bind=engine)
 
 class UserDB(Base):
     __tablename__ = "users"
@@ -78,13 +75,6 @@ class UserDB(Base):
     line_token = Column(String, nullable=True) # เก็บ Telegram Chat ID
     schedule_json = Column(Text, default="[]") 
     last_updated = Column(DateTime, default=datetime.now)
-
-# สร้างตารางใน Database (ถ้ายังไม่มี)
-try:
-    Base.metadata.create_all(bind=engine)
-    log("✅ สร้าง/ตรวจสอบตารางใน Database สำเร็จ")
-except Exception as e:
-    log(f"❌ สร้างตารางพลาด: {e}")
 
 def get_db():
     db = SessionLocal()
@@ -276,7 +266,7 @@ def api_login(req: LoginRequest, db: Session = Depends(get_db)):
         user.last_updated = datetime.now()
         db.commit()
         
-        log(f"💾 บันทึกข้อมูลลง Database เรียบร้อย")
+        log(f"💾 บันทึกตารางลง Database เรียบร้อย")
         return {"status": "success", "data": enriched_schedule}
     except Exception as e:
         log(f"❌ API Error: {e}")
@@ -295,6 +285,7 @@ def api_save_token(req: TokenRequest, db: Session = Depends(get_db)):
             db.add(user)
         user.line_token = req.line_token
         db.commit()
+        log(f"💾 บันทึก Chat ID เรียบร้อย")
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
